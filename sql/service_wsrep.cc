@@ -217,8 +217,6 @@ extern "C" void wsrep_handle_SR_rollback(THD *bf_thd,
 extern "C" my_bool wsrep_thd_bf_abort(THD *bf_thd, THD *victim_thd,
                                       my_bool signal)
 {
-  mysql_mutex_assert_owner(&victim_thd->LOCK_thd_kill);
-  mysql_mutex_assert_not_owner(&victim_thd->LOCK_thd_data);
   my_bool ret= wsrep_bf_abort(bf_thd, victim_thd);
   /*
     Send awake signal if victim was BF aborted or does not
