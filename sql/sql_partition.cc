@@ -4876,7 +4876,7 @@ uint prep_alter_part_table(THD *thd, TABLE *table, Alter_info *alter_info,
        ALTER_PARTITION_REORGANIZE |
        ALTER_PARTITION_TABLE_REORG |
        ALTER_PARTITION_REBUILD |
-       ALTER_PARTITION_ADD_FROM_TABLE))
+       ALTER_PARTITION_CONVERT_IN))
   {
     /*
       You can't add column when we are doing alter related to partition
@@ -5080,9 +5080,15 @@ uint prep_alter_part_table(THD *thd, TABLE *table, Alter_info *alter_info,
         goto err;
       }
     }
-    if ((alter_info->partition_flags & ALTER_PARTITION_ADD) ||
-        (alter_info->partition_flags & ALTER_PARTITION_ADD_FROM_TABLE))
+    if ((alter_info->partition_flags & ALTER_PARTITION_ADD))
     {
+      if ((alter_info->partition_flags & ALTER_PARTITION_CONVERT_IN) &&
+          !(tab_part_info->part_type == RANGE_PARTITION ||
+            tab_part_info->part_type == LIST_PARTITION))
+      {
+        my_error(ER_ONLY_ON_RANGE_LIST_PARTITION, MYF(0), "CONVERT TABLE TO");
+        goto err;
+      }
       if (*fast_alter_table && thd->locked_tables_mode)
       {
         MEM_ROOT *old_root= thd->mem_root;
@@ -6435,14 +6441,22 @@ static bool write_log_changed_partitions(ALTER_PARTITION_PARAM_TYPE *lpt,
     FALSE                    Success
 */
 
+enum log_action_enum
+{
+  ACT_DROP = 0,
+  ACT_CONVERT_IN,
+  ACT_CONVERT_OUT
+};
+
 static bool log_drop_or_convert_action(ALTER_PARTITION_PARAM_TYPE *lpt,
                                            uint *next_entry,
                                            const char *path,
                                            const char *from_name,
-                                           bool temp_list)
+                                           bool temp_list,
+                                           const log_action_enum convert_action)
 {
   DDL_LOG_ENTRY ddl_log_entry;
-  const bool convert_action= (from_name != NULL);
+  DBUG_ASSERT(convert_action == ACT_DROP || (from_name != NULL));
   partition_info *part_info= lpt->part_info;
   DDL_LOG_MEMORY_ENTRY *log_entry;
   char tmp_path[FN_REFLEN + 1];
@@ -6477,7 +6491,10 @@ static bool log_drop_or_convert_action(ALTER_PARTITION_PARAM_TYPE *lpt,
         name_variant= TEMP_PART_NAME;
       else
         name_variant= NORMAL_PART_NAME;
-      DBUG_ASSERT(!convert_action || part_elem->part_state == PART_TO_BE_DROPPED);
+      DBUG_ASSERT(convert_action != ACT_CONVERT_IN ||
+                  part_elem->part_state == PART_TO_BE_ADDED);
+      DBUG_ASSERT(convert_action != ACT_CONVERT_OUT ||
+                  part_elem->part_state == PART_TO_BE_DROPPED);
       if (part_info->is_sub_partitioned())
       {
         DBUG_ASSERT(!convert_action);
@@ -6514,9 +6531,18 @@ static bool log_drop_or_convert_action(ALTER_PARTITION_PARAM_TYPE *lpt,
                                   part_elem->partition_name, name_variant,
                                   TRUE))
           DBUG_RETURN(TRUE);
-        ddl_log_entry.name= { tmp_path, strlen(tmp_path) };
-        if (convert_action)
-          ddl_log_entry.from_name= { from_name, strlen(from_name) };
+        switch (convert_action)
+        {
+          case ACT_CONVERT_OUT:
+            ddl_log_entry.from_name= { from_name, strlen(from_name) };
+            /* fall through */
+          case ACT_DROP:
+            ddl_log_entry.name= { tmp_path, strlen(tmp_path) };
+            break;
+          case ACT_CONVERT_IN:
+            ddl_log_entry.name= { from_name, strlen(from_name) };
+            ddl_log_entry.from_name= { tmp_path, strlen(tmp_path) };
+        }
         if (ddl_log_write_entry(&ddl_log_entry, &log_entry))
         {
           DBUG_RETURN(TRUE);
@@ -6537,19 +6563,24 @@ static bool write_log_dropped_partitions(ALTER_PARTITION_PARAM_TYPE *lpt,
                                          const char *path,
                                          bool temp_list)
 {
-  return log_drop_or_convert_action(lpt, next_entry, path, NULL, temp_list);
+  return log_drop_or_convert_action(lpt, next_entry, path, NULL, temp_list, ACT_DROP);
 }
 
 inline
-static bool write_log_convert_out_partition(ALTER_PARTITION_PARAM_TYPE *lpt,
-                                           uint *next_entry,
-                                           const char *path)
+static bool write_log_convert_partition(ALTER_PARTITION_PARAM_TYPE *lpt,
+                                        uint *next_entry,
+                                        const char *path)
 {
-  char from_name[FN_REFLEN + 1];
-  build_table_filename(from_name, sizeof(from_name) - 1, lpt->alter_ctx->new_db.str,
+  char other_table[FN_REFLEN + 1];
+  const auto f= lpt->alter_info->partition_flags;
+  DBUG_ASSERT((f & ALTER_PARTITION_CONVERT_IN) || (f & ALTER_PARTITION_CONVERT_OUT));
+  const log_action_enum convert_action= (f & ALTER_PARTITION_CONVERT_IN) ?
+                                          ACT_CONVERT_IN : ACT_CONVERT_OUT;
+  build_table_filename(other_table, sizeof(other_table) - 1, lpt->alter_ctx->new_db.str,
                        lpt->alter_ctx->new_name.str, "", 0);
   DDL_LOG_MEMORY_ENTRY *main_entry= lpt->part_info->main_entry;
-  bool res= log_drop_or_convert_action(lpt, next_entry, path, from_name, false);
+  bool res= log_drop_or_convert_action(lpt, next_entry, path, other_table,
+                                       false, convert_action);
   /*
     NOTE: main_entry is "drop shadow frm", we have to keep it like this,
     because partitioning crash-safety disables it at install shadow FRM phase
@@ -6593,6 +6624,16 @@ static bool write_log_drop_shadow_frm(ALTER_PARTITION_PARAM_TYPE *lpt,
   mysql_mutex_lock(&LOCK_gdl);
   if (write_log_delete_frm(lpt, (const char*)path))
     goto error;
+
+  if (flags & WFRM_DROP_CONVERTED_FROM)
+  {
+    TABLE_LIST *table_from= lpt->table_list->next_local;
+    build_table_filename(path, sizeof(path) - 1, table_from->db.str,
+                         table_from->table_name.str, "", 0);
+
+    if (write_log_delete_frm(lpt, (const char*) path))
+      goto error;
+  }
 
   log_entry= part_info->list;
   if (ddl_log_write_execute_entry(log_entry->entry_pos,
@@ -6713,7 +6754,7 @@ error:
 }
 
 
-static bool write_log_convert_out_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
+static bool write_log_convert_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
 {
   partition_info *part_info= lpt->part_info;
   char tmp_path[FN_REFLEN + 1];
@@ -6725,7 +6766,7 @@ static bool write_log_convert_out_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
 
   mysql_mutex_lock(&LOCK_gdl);
 
-  if (write_log_convert_out_partition(lpt, &next_entry, (const char*)path))
+  if (write_log_convert_partition(lpt, &next_entry, (const char*)path))
     goto error;
   DBUG_ASSERT(next_entry == part_info->list->entry_pos);
   if (ddl_log_write_execute_entry(part_info->list->entry_pos,
@@ -7207,16 +7248,11 @@ bool log_partition_alter_to_ddl_log(ALTER_PARTITION_PARAM_TYPE *lpt)
 }
 
 
-extern bool move_table_to_partition(ALTER_PARTITION_PARAM_TYPE *lpt);
-
+extern bool alter_partition_convert_in(ALTER_PARTITION_PARAM_TYPE *lpt);
 
 /**
-  Check that definition of a table specified in the clause FROM of
-  the statement ALTER TABLE <tablename> ADD PARTITION ... FROM <from_table>
-  fit with definition of a partition being added and every row stored in
-  the table <from_table> conform with partition's expression. On return from
-  the function an actual name of a file corresponding to the partition
-  is stored in the buffer  part_file_name_buf.
+  Check that definition of source table fits definition of partition being
+  added and every row stored in the table conforms partition's expression.
 
   @param lpt  Structure containing parameters required for checking
   @param[in,out] part_file_name_buf  Buffer for storing a partition name
@@ -7227,8 +7263,12 @@ extern bool move_table_to_partition(ALTER_PARTITION_PARAM_TYPE *lpt);
   @return false on success, true on error
 */
 
-static bool check_table_data_fit_new_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
+static bool check_table_data(ALTER_PARTITION_PARAM_TYPE *lpt)
 {
+  /*
+     TODO: if destination is partitioned by range(X) and source is indexed by X
+     then just get min(X) and max(X) from index.
+  */
   THD *thd= lpt->thd;
   TABLE *table_to= lpt->table_list->table;
   TABLE *table_from= lpt->table_list->next_local->table;
@@ -7245,10 +7285,7 @@ static bool check_table_data_fit_new_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
 
   uint32 new_part_id;
   partition_element *part_elem;
-  // FIXME: really?
-  const char* partition_name=
-    thd->lex->part_info->curr_part_elem->partition_name;
-
+  const char* partition_name= thd->lex->part_info->curr_part_elem->partition_name;
   part_elem= table_to->part_info->get_part_elem(partition_name,
                                                 nullptr, 0, &new_part_id);
   if (unlikely(!part_elem))
@@ -7265,114 +7302,6 @@ static bool check_table_data_fit_new_partition(ALTER_PARTITION_PARAM_TYPE *lpt)
   {
     return true;
   }
-
-  return false;
-}
-
-
-/**
-  Check whether metadata of a partitioned table and a being moved to partition
-  are equal
-
-  @para[in, out] lpt  Struct containing parameters required for handling of
-                    the statement ALTER TABLE
-
-  @return false on ok (tables metadata are equal),
-          true on error (tables metadata are different)
-*/
-
-static bool compare_tables_metadata(ALTER_PARTITION_PARAM_TYPE *lpt)
-{
-  TABLE *part_table= lpt->table_list->table;
-  TABLE *table= lpt->table_list->next_local->table;
-  bool metadata_equal;
-  HA_CREATE_INFO *part_create_info= lpt->create_info;
-
-  handlerton *db_type= part_create_info->db_type;
-  part_create_info->db_type= part_table->part_info->default_engine_type;
-
-  if (mysql_compare_tables(table, lpt->alter_info, part_create_info,
-                          &metadata_equal))
-
-  {
-    part_create_info->db_type= db_type;
-    my_error(ER_TABLES_DIFFERENT_METADATA, MYF(0));
-    return true;
-  }
-
-  part_create_info->db_type= db_type;
-
-  DEBUG_SYNC(lpt->thd, "swap_partition_after_compare_tables");
-  if (!metadata_equal)
-  {
-    my_error(ER_TABLES_DIFFERENT_METADATA, MYF(0));
-    return true;
-  }
-  DBUG_ASSERT(table->s->db_create_options ==
-              part_table->s->db_create_options);
-  DBUG_ASSERT(table->s->db_options_in_use ==
-              part_table->s->db_options_in_use);
-
-  if (table->s->avg_row_length != part_create_info->avg_row_length)
-  {
-    my_error(ER_PARTITION_EXCHANGE_DIFFERENT_OPTION, MYF(0),
-            "AVG_ROW_LENGTH");
-    return true;
-  }
-
-  if (table->s->db_create_options != part_create_info->table_options)
-  {
-    my_error(ER_PARTITION_EXCHANGE_DIFFERENT_OPTION, MYF(0),
-            "TABLE OPTION");
-    return true;
-  }
-
-  if (table->s->table_charset != part_table->s->table_charset)
-  {
-    my_error(ER_PARTITION_EXCHANGE_DIFFERENT_OPTION, MYF(0),
-            "CHARACTER SET");
-    return true;
-  }
-
-  return false;
-}
-
-
-/**
-  For the statement is ALTER TABLE ... ADD PARTITION... FROM <tbl_name>
-  check that partition metadata is compatible with table definition and
-  partition type supported for moving table to partition.
-
-  @param lpt  Structure containing parameters required for handling of
-              the statement ALTER TABLE
-
-  @return false on success, true on failure
-*/
-
-static bool check_table_and_partition_compatibility(
-  ALTER_PARTITION_PARAM_TYPE *lpt)
-{
-  partition_info* tab_part_info= lpt->table->part_info;
-  DBUG_ASSERT((lpt->alter_info->partition_flags &
-               ALTER_PARTITION_ADD_FROM_TABLE));
-  if (tab_part_info->part_type != RANGE_PARTITION &&
-      tab_part_info->part_type != LIST_PARTITION)
-  {
-    /*
-        ALTER TABLE ... ADD PARTITION ... FROM TABLE is not compatible with
-        partition methods other RANGE and LIST.
-     */
-    my_error(ER_PARTITION_METHOD_NOT_COMPATIBLE_WITH_ADD_FROM_TABLE,
-             MYF(0), (tab_part_info->part_type == HASH_PARTITION ?
-                 "HASH": "VERSIONING"));
-    return true;
-  }
-
-  if (compare_tables_metadata(lpt))
-    return true;
-
-  if (check_table_data_fit_new_partition(lpt))
-    return true;
 
   return false;
 }
@@ -7615,7 +7544,7 @@ uint fast_alter_partition_table(THD *thd, TABLE *table,
         wait_while_table_is_used(thd, table, HA_EXTRA_NOT_USED) ||
         ERROR_INJECT_CRASH("crash_convert_partition_4") ||
         ERROR_INJECT_ERROR("fail_convert_partition_4") ||
-        write_log_convert_out_partition(lpt) ||
+        write_log_convert_partition(lpt) ||
         ERROR_INJECT_CRASH("crash_convert_partition_5") ||
         ERROR_INJECT_ERROR("fail_convert_partition_5") ||
         alter_close_table(lpt) ||
@@ -7663,55 +7592,60 @@ uint fast_alter_partition_table(THD *thd, TABLE *table,
     if (alter_partition_lock_handling(lpt))
       goto err;
   }
-  else if ((alter_info->partition_flags & ALTER_PARTITION_ADD_FROM_TABLE))
+  else if ((alter_info->partition_flags & ALTER_PARTITION_CONVERT_IN))
   {
     TABLE *table_from= table_list->next_local->table;
 
-    if (write_log_drop_shadow_frm(lpt) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_1") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_1") ||
-        mysql_write_frm(lpt, WFRM_WRITE_SHADOW) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_2") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_2") ||
-        wait_while_table_is_used(thd, table, HA_EXTRA_NOT_USED) ||
-        wait_while_table_is_used(thd, table_from,
-                                 HA_EXTRA_PREPARE_FOR_RENAME) ||
+    if (wait_while_table_is_used(thd, table, HA_EXTRA_NOT_USED) ||
+        wait_while_table_is_used(thd, table_from, HA_EXTRA_PREPARE_FOR_RENAME) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_1") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_1") ||
+        compare_table_with_partition(thd, table_from, table, NULL, 0) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_2") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_2") ||
+        check_table_data(lpt))
+      goto err;
 
-        ERROR_INJECT_CRASH("crash_add_partition_from_3") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_3") ||
-        write_log_add_change_partition(lpt) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_4") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_4") ||
-        mysql_change_partitions(lpt) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_5") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_5") ||
+    if (write_log_drop_shadow_frm(lpt) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_3") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_3") ||
+        mysql_write_frm(lpt, WFRM_WRITE_SHADOW) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_4") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_4") ||
         alter_close_table(lpt) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_6") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_6") ||
-        check_table_and_partition_compatibility(lpt) ||
-        move_table_to_partition(lpt) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_7") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_7") ||
-        write_log_rename_frm(lpt) ||
-        (action_completed= TRUE, FALSE) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_8") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_8") ||
-        (frm_install= TRUE, FALSE) ||
-        mysql_write_frm(lpt, WFRM_INSTALL_SHADOW) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_5") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_5") ||
+        write_log_convert_partition(lpt) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_6") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_6") ||
+        alter_partition_convert_in(lpt) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_7") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_7") ||
+        (frm_install= true, false) ||
+        mysql_write_frm(lpt, WFRM_INSTALL_SHADOW|WFRM_BACKUP_ORIGINAL) ||
         log_partition_alter_to_ddl_log(lpt) ||
-        (frm_install= FALSE, FALSE) ||
-        ERROR_INJECT_CRASH("crash_add_partition_from_9") ||
-        ERROR_INJECT_ERROR("fail_add_partition_from_9") ||
-        (write_log_completed(lpt, FALSE), FALSE) ||
+        (frm_install= false, false) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_8") ||
+        ERROR_INJECT_ERROR("fail_convert_partition_8") ||
         ((!thd->lex->no_write_to_binlog) &&
-            (write_bin_log(thd, FALSE,
-                           thd->query(), thd->query_length()), FALSE)) ||
-                           ERROR_INJECT_CRASH("crash_add_partition_from_10") ||
-                           ERROR_INJECT_ERROR("fail_add_partition_from_10"))
+          (thd->binlog_xid= thd->query_id,
+          ddl_log_update_xid(lpt->part_info, thd->binlog_xid),
+          write_bin_log(thd, false,
+                        thd->query(), thd->query_length()),
+          thd->binlog_xid= 0)) ||
+        (ddl_log_complete(lpt->part_info), false) ||
+        /* See above TODO (ALTER_PARTITION_CONVERT_OUT). */
+        write_log_drop_shadow_frm(lpt, WFRM_DROP_BACKUP |
+                                  WFRM_DROP_CONVERTED_FROM) ||
+        ERROR_INJECT_CRASH("crash_convert_partition_9") ||
+        ERROR_INJECT_ERROR("fail_extract_partition_9"))
     {
+      (void) ddl_log_revert(thd, lpt->part_info);
       handle_alter_part_error(lpt, action_completed, FALSE, frm_install);
       goto err;
     }
+    /* Drop backup frm and converted from frm */
+    (void) ddl_log_revert(thd, lpt->part_info);
     if (alter_partition_lock_handling(lpt))
       goto err;
 
@@ -7720,7 +7654,7 @@ uint fast_alter_partition_table(THD *thd, TABLE *table,
            (part_info->part_type == RANGE_PARTITION ||
             part_info->part_type == LIST_PARTITION))
   {
-    DBUG_ASSERT(!(alter_info->partition_flags & ALTER_PARTITION_ADD_FROM_TABLE));
+    DBUG_ASSERT(!(alter_info->partition_flags & ALTER_PARTITION_CONVERT_IN));
     /*
       ADD RANGE/LIST PARTITIONS
       In this case there are no tuples removed and no tuples are added.
