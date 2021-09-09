@@ -464,7 +464,7 @@ public:
     int wait_result= 0;
     struct timespec wait_time;
     int ret= 0;
-    mysql_cond_t wait_cond;
+    mysql_cond_t wait_cond= {};
     mysql_cond_init(key_COND_wsrep_gtid_wait_upto, &wait_cond, NULL);
     set_timespec(wait_time, timeout);
     mysql_mutex_lock(&LOCK_wsrep_gtid_wait_upto);

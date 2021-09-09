@@ -66,6 +66,23 @@ struct st_debug_sync_control
   char                  ds_proc_info[80];       /* proc_info string */
 };
 
+static uchar *signal_key(const LEX_STRING *str, size_t *klen, my_bool)
+{
+  *klen= str->length;
+  return (uchar*) str->str;
+}
+
+static inline void clear_set(Hash_set<LEX_STRING> *set)
+{
+  Hash_set<LEX_STRING>::Iterator it{*set};
+  LEX_STRING *s;
+  while ((s= it++))
+  {
+    my_free(s->str);
+    my_free(s);
+  }
+  set->clear();
+}
 
 /**
   Definitions for the debug sync facility.
@@ -75,13 +92,20 @@ struct st_debug_sync_control
 */
 struct st_debug_sync_globals
 {
-  String                ds_signal;              /* signal variable */
+  Hash_set<LEX_STRING>  ds_signal_set;          /* signal variable */
   mysql_cond_t          ds_cond;                /* condition variable */
   mysql_mutex_t         ds_mutex;               /* mutex variable */
   ulonglong             dsp_hits;               /* statistics */
   ulonglong             dsp_executed;           /* statistics */
   ulonglong             dsp_max_active;         /* statistics */
+
+  st_debug_sync_globals() : ds_signal_set(PSI_NOT_INSTRUMENTED, signal_key) {};
+  ~st_debug_sync_globals()
+  {
+    clear_set(&ds_signal_set);
+  }
 };
+
 static st_debug_sync_globals debug_sync_global; /* All globals in one object */
 
 /**
@@ -161,7 +185,7 @@ int debug_sync_init(void)
     int rc;
 
     /* Initialize the global variables. */
-    debug_sync_global.ds_signal.length(0);
+    debug_sync_global.ds_signal_set.clear();
     if ((rc= mysql_cond_init(key_debug_sync_globals_ds_cond,
                              &debug_sync_global.ds_cond, NULL)) ||
         (rc= mysql_mutex_init(key_debug_sync_globals_ds_mutex,
@@ -195,7 +219,7 @@ void debug_sync_end(void)
     debug_sync_C_callback_ptr= NULL;
 
     /* Destroy the global variables. */
-    debug_sync_global.ds_signal.free();
+    clear_set(&debug_sync_global.ds_signal_set);
     mysql_cond_destroy(&debug_sync_global.ds_cond);
     mysql_mutex_destroy(&debug_sync_global.ds_mutex);
 
@@ -555,7 +579,7 @@ static void debug_sync_reset(THD *thd)
 
   /* Clear the global signal. */
   mysql_mutex_lock(&debug_sync_global.ds_mutex);
-  debug_sync_global.ds_signal.length(0);
+  clear_set(&debug_sync_global.ds_signal_set);
   mysql_mutex_unlock(&debug_sync_global.ds_mutex);
 
   DBUG_VOID_RETURN;
@@ -1313,13 +1337,18 @@ uchar *debug_sync_value_ptr(THD *thd)
 
   if (opt_debug_sync_timeout)
   {
-    static char on[]= "ON - current signal: '"; 
+    static char on[]= "ON - current signals: '"; 
 
     // Ensure exclusive access to debug_sync_global.ds_signal
     mysql_mutex_lock(&debug_sync_global.ds_mutex);
 
-    size_t lgt= (sizeof(on) /* includes '\0' */ +
-                 debug_sync_global.ds_signal.length() + 1 /* for '\'' */);
+    size_t lgt= sizeof(on) /* includes '\0' */;
+
+    for (size_t i= 0; i < debug_sync_global.ds_signal_set.size(); i++)
+    {
+      /* last +1 is for '\'' */
+      lgt+= debug_sync_global.ds_signal_set.at(i)->length + 1;
+    }
     char *vend;
     char *vptr;
 
@@ -1327,8 +1356,13 @@ uchar *debug_sync_value_ptr(THD *thd)
     {
       vend= value + lgt - 1; /* reserve space for '\0'. */
       vptr= debug_sync_bmove_len(value, vend, STRING_WITH_LEN(on));
-      vptr= debug_sync_bmove_len(vptr, vend, debug_sync_global.ds_signal.ptr(),
-                                 debug_sync_global.ds_signal.length());
+      for (size_t i= 0; i < debug_sync_global.ds_signal_set.size(); i++)
+      {
+        const LEX_STRING *s= debug_sync_global.ds_signal_set.at(i);
+        vptr= debug_sync_bmove_len(vptr, vend, s->str, s->length);
+        if (i != debug_sync_global.ds_signal_set.size() - 1)
+          *(vptr++)= ',';
+      }
       if (vptr < vend)
         *(vptr++)= '\'';
       *vptr= '\0'; /* We have one byte reserved for the worst case. */
@@ -1344,6 +1378,40 @@ uchar *debug_sync_value_ptr(THD *thd)
 
   DBUG_RETURN((uchar*) value);
 }
+
+/**
+  Return true if the signal is found in global signal list.
+
+  @param signal_name Signal name identifying the signal.
+
+  @note
+    If signal is found in the global signal set, it means that the
+    signal thread has signalled to the waiting thread. This method
+    must be called with the debug_sync_global.ds_mutex held.
+
+  @retval true  if signal is found in the global signal list.
+  @retval false otherwise.
+*/
+
+static inline bool is_signalled(String *signal_name)
+{
+  return debug_sync_global.ds_signal_set.find(signal_name->ptr(), signal_name->length());
+}
+
+static void clear_signal_event(String *signal_name)
+{
+  DBUG_ENTER("clear_signal_event");
+  LEX_STRING *record= debug_sync_global.ds_signal_set.find(signal_name->ptr(), signal_name->length());
+  if (record)
+  {
+    DBUG_PRINT("clear_signal_event", ("FREEING STRING %p %s", record, record->str));
+    debug_sync_global.ds_signal_set.remove(record);
+    my_free(record->str);
+    my_free(record);
+  }
+  DBUG_VOID_RETURN;
+}
+
 
 
 /**
@@ -1401,12 +1469,22 @@ static void debug_sync_execute(THD *thd, st_debug_sync_action *action)
       read access too, to create a memory barrier in order to avoid that
       threads just reads an old cached version of the signal.
     */
-    mysql_mutex_lock(&debug_sync_global.ds_mutex);
+
+        mysql_mutex_lock(&debug_sync_global.ds_mutex);
 
     if (action->signal.length())
     {
-      /* Copy the signal to the global variable. */
-      if (debug_sync_global.ds_signal.copy(action->signal))
+      LEX_STRING *s= (LEX_STRING *) my_malloc(PSI_NOT_INSTRUMENTED,
+                                              sizeof(LEX_STRING), MYF(0));
+      s->length= action->signal.length();
+      s->str= (char *) my_malloc(PSI_NOT_INSTRUMENTED,
+                                 action->signal.length() + 1, MYF(0));
+      memcpy(s->str, action->signal.ptr(), action->signal.length());
+      s->str[action->signal.length()] = '\0';
+      DBUG_PRINT("debug_sync_exec", ("ALLOCATING STRING! %p %s", s, s->str));
+
+
+      if (debug_sync_global.ds_signal_set.insert(s))
       {
         /*
           Error is reported by my_malloc().
@@ -1449,12 +1527,12 @@ static void debug_sync_execute(THD *thd, st_debug_sync_action *action)
         restore_current_mutex = false;
 
       set_timespec(abstime, action->timeout);
+      // TODO turn this into a for loop printing.
       DBUG_EXECUTE("debug_sync_exec", {
           /* Functions as DBUG_PRINT args can change keyword and line nr. */
-          const char *sig_glob= debug_sync_global.ds_signal.c_ptr();
           DBUG_PRINT("debug_sync_exec",
-                     ("wait for '%s'  at: '%s'  curr: '%s'",
-                      sig_wait, dsp_name, sig_glob));});
+                     ("wait for '%s'  at: '%s'",
+                      sig_wait, dsp_name));});
 
       /*
         Wait until global signal string matches the wait_for string.
@@ -1462,18 +1540,18 @@ static void debug_sync_execute(THD *thd, st_debug_sync_action *action)
         The facility can become disabled when some thread cannot get
         the required dynamic memory allocated.
       */
-      while (stringcmp(&debug_sync_global.ds_signal, &action->wait_for) &&
-             !thd->killed && opt_debug_sync_timeout)
+      while (!is_signalled(&action->wait_for) && !thd->killed &&
+             opt_debug_sync_timeout)
       {
         error= mysql_cond_timedwait(&debug_sync_global.ds_cond,
                                     &debug_sync_global.ds_mutex,
                                     &abstime);
+        // TODO turn this into a for loop printing.
         DBUG_EXECUTE("debug_sync", {
             /* Functions as DBUG_PRINT args can change keyword and line nr. */
-            const char *sig_glob= debug_sync_global.ds_signal.c_ptr();
             DBUG_PRINT("debug_sync",
-                       ("awoke from %s  global: %s  error: %d",
-                        sig_wait, sig_glob, error));});
+                       ("awoke from %s error: %d",
+                        sig_wait, error));});
         if (unlikely(error == ETIMEDOUT || error == ETIME))
         {
           // We should not make the statement fail, even if in strict mode.
@@ -1486,6 +1564,8 @@ static void debug_sync_execute(THD *thd, st_debug_sync_action *action)
         }
         error= 0;
       }
+      // TODO conditional on clear-event
+      clear_signal_event(&action->wait_for);
       DBUG_EXECUTE("debug_sync_exec",
                    if (thd->killed)
                      DBUG_PRINT("debug_sync_exec",

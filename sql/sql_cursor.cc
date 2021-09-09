@@ -58,6 +58,7 @@ public:
     return table->export_structure(thd, defs);
   }
   virtual ~Materialized_cursor();
+  static void operator delete(void *ptr, size_t size) {};
 
   void on_table_fill_finished();
 };

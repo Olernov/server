@@ -2489,8 +2489,9 @@ yyreturn:
       YYPOPSTACK (1);
     }
 #ifndef yyoverflow
-  if (yyss != yyssa)
+  /*if (yyss != yyssa)
     YYSTACK_FREE (yyss);
+    */
 #endif
 
   return yyresult;

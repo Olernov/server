@@ -132,7 +132,7 @@ bool Apc_target::make_apc_call(THD *caller_thd, Apc_call *call,
   if (enabled)
   {
     /* Create and post the request */
-    Call_request apc_request;
+    Call_request apc_request= {};
     apc_request.call= call;
     apc_request.processed= FALSE;
     mysql_cond_init(key_show_explain_request_COND, &apc_request.COND_request,
