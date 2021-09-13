@@ -1062,7 +1062,11 @@ THR_LOCK_DATA **ha_spider::store_lock(
     *to++ = &wide_handler->lock;
     DBUG_RETURN(to);
   }
-  check_access_kind(thd);
+  if (check_access_kind_for_connection(thd,
+    (wide_handler->lock_type >= TL_WRITE_ALLOW_WRITE)))
+  {
+    DBUG_RETURN(to);
+  }
   DBUG_PRINT("info",("spider sql_command=%u", wide_handler->sql_command));
   DBUG_PRINT("info",("spider lock_type=%d", lock_type));
   DBUG_PRINT("info",("spider thd->query_id=%lld", thd->query_id));
