@@ -285,7 +285,7 @@ dberr_t file_os_io::open(const char *path, bool read_only) noexcept
   bool success;
   auto tmp_fd= os_file_create(
       innodb_log_file_key, path, OS_FILE_OPEN | OS_FILE_ON_ERROR_NO_EXIT,
-      OS_FILE_NORMAL, OS_LOG_FILE, read_only, &success);
+      OS_FILE_AIO, OS_LOG_FILE, read_only, &success);
   if (!success)
     return DB_ERROR;
 
@@ -314,11 +314,21 @@ dberr_t file_os_io::read(os_offset_t offset, span<byte> buf) noexcept
   return os_file_read(IORequestRead, m_fd, buf.data(), offset, buf.size());
 }
 
-dberr_t file_os_io::write(const char *path, os_offset_t offset,
-                          span<const byte> buf) noexcept
+dberr_t file_os_io::write(const char *path, tpool::aiocb *cb, bool sync) noexcept
 {
-  return os_file_write(IORequestWrite, path, m_fd, buf.data(), offset,
-                       buf.size());
+  if (sync)
+  {
+    dberr_t err =  os_file_write(IORequestWrite, path, m_fd, cb->m_buffer, cb->m_offset,
+                       cb->m_len);
+    if (err)
+      return (err);
+    cb->m_ret_len= cb->m_len;
+    cb->m_err= 0;
+    if (cb->m_callback)
+      cb->m_callback(cb);
+    return DB_SUCCESS;
+  }
+  return os_file_submit_aio(m_fd, path, cb);
 }
 
 dberr_t file_os_io::flush() noexcept
@@ -356,10 +366,14 @@ public:
     memcpy(buf.data(), m_file.data() + offset, buf.size());
     return DB_SUCCESS;
   }
-  dberr_t write(const char *, os_offset_t offset,
-                span<const byte> buf) noexcept final
+  dberr_t write(const char *, tpool::aiocb *cb,
+                            bool sync) noexcept final
   {
     pmem_memcpy_persist(m_file.data() + offset, buf.data(), buf.size());
+    cb->m_ret_len= cb->m_len;
+    cb->m_err= 0;
+    if (cb->m_callback)
+      cb->m_callback(cb);
     return DB_SUCCESS;
   }
   dberr_t flush() noexcept final
@@ -367,7 +381,10 @@ public:
     ut_ad(0);
     return DB_SUCCESS;
   }
-
+  bool async_io_supported noexcept final
+  {
+    return false;
+  }
 private:
   mapped_file_t m_file;
 };
@@ -428,10 +445,10 @@ bool log_file_t::writes_are_durable() const noexcept
   return m_file->writes_are_durable();
 }
 
-dberr_t log_file_t::write(os_offset_t offset, span<const byte> buf) noexcept
+dberr_t log_file_t::write(tpool::aiocb *cb, bool sync) noexcept
 {
   ut_ad(is_opened());
-  return m_file->write(m_path.c_str(), offset, buf);
+  return m_file->write(m_path.c_str(),cb, sync);
 }
 
 dberr_t log_file_t::flush() noexcept
@@ -490,16 +507,37 @@ bool log_t::file::writes_are_durable() const noexcept
   return fd.writes_are_durable();
 }
 
-void log_t::file::write(os_offset_t offset, span<byte> buf)
+void log_t::file::begin_write(tpool::aiocb *cb, bool sync)
 {
   srv_stats.os_log_pending_writes.inc();
-  if (const dberr_t err= fd.write(offset, buf))
+  if (const dberr_t err= fd.write(cb, sync))
     ib::fatal() << "write(" << fd.get_path() << ") returned " << err;
+}
+
+void log_t::file::complete_write(tpool::aiocb *cb)
+{
+  if (cb->m_err)
+    ib::fatal() << "write(" << fd.get_path() << ") returned " << cb->m_err;
+
   srv_stats.os_log_pending_writes.dec();
-  srv_stats.os_log_written.add(buf.size());
+  srv_stats.os_log_written.add(cb->m_len);
   srv_stats.log_writes.inc();
   log_sys.n_log_ios++;
 }
+
+void log_t::file::write(os_offset_t offset, span<byte> buf)
+{
+  tpool::aiocb cb;
+  cb.m_offset = offset;
+  cb.m_buffer=buf.begin();
+  ut_a(buf.size() < INT_MAX);
+  cb.m_len= (int)buf.size();
+  cb.m_callback=nullptr; /* No callback function */
+
+  begin_write(&cb,true);
+  complete_write(&cb);
+}
+
 
 void log_t::file::flush()
 {
@@ -547,10 +585,12 @@ log_write_buf(
 	lsn_t		start_lsn,	/*!< in: start lsn of the buffer; must
 					be divisible by
 					OS_FILE_LOG_BLOCK_SIZE */
-	ulint		new_data_offset)/*!< in: start offset of new data in
+	ulint		new_data_offset,/*!< in: start offset of new data in
 					buf: this parameter is used to decide
 					if we have to write a new log file
 					header */
+	bool sync,
+	tpool::aiocb *cb)
 {
 	ulint		write_len;
 	lsn_t		next_offset;
@@ -610,15 +650,20 @@ loop:
 	}
 
 	ut_a((next_offset >> srv_page_size_shift) <= ULINT_MAX);
-
-	log_sys.log.write(static_cast<size_t>(next_offset), {buf, write_len});
-
-	if (write_len < len) {
-		start_lsn += write_len;
-		len -= write_len;
-		buf += write_len;
-		goto loop;
-	}
+  bool last_write= write_len >= len;
+  if (!last_write)
+  {
+    log_sys.log.write(next_offset, {buf, write_len});
+    start_lsn+= write_len;
+    len-= write_len;
+    buf+= write_len;
+    goto loop;
+  }
+  cb->m_offset= next_offset;
+  cb->m_buffer = buf;
+  ut_a(write_len < INT_MAX);
+  cb->m_len = (int)write_len;
+  log_sys.log.begin_write(cb,sync);
 }
 
 /** Flush the recently written changes to the log file.
@@ -660,6 +705,26 @@ log_buffer_switch()
 log writes have been completed. */
 void log_flush_notify(lsn_t flush_lsn);
 
+static void log_write_complete_io(tpool::aiocb *cb);
+
+/**
+  Information which is passed during async log IO
+  the completion thread. We keep it global variable
+  as it is protected by the group commit lock, and
+  there can be only single outstanding IO.
+*/
+struct Log_aio_cb:tpool::aiocb
+{
+  lsn_t write_lsn=0;
+  bool do_flush=false;
+  bool do_write= false;
+  bool synchronous_io=false;
+#ifndef DBUG_OFF
+  bool crash_on_completion=false;
+#endif
+};
+
+
 /**
 Writes log buffer to disk
 which is the "write" part of log_write_up_to().
@@ -670,17 +735,12 @@ Note : the caller must have log_sys.mutex locked, and this
 mutex is released in the function.
 
 */
-static void log_write(bool rotate_key)
+static void log_write(bool rotate_key, bool sync, tpool::aiocb *cb)
 {
 	mysql_mutex_assert_owner(&log_sys.mutex);
 	ut_ad(!recv_no_log_write);
 	lsn_t write_lsn;
-	if (log_sys.buf_free == log_sys.buf_next_to_write) {
-		/* Nothing to write */
-		mysql_mutex_unlock(&log_sys.mutex);
-		return;
-	}
-
+	ut_a (log_sys.buf_free != log_sys.buf_next_to_write);
 	ulint		start_offset;
 	ulint		end_offset;
 	ulint		area_start;
@@ -750,7 +810,7 @@ static void log_write(bool rotate_key)
 			  area_end - area_start,
 			  rotate_key ? LOG_ENCRYPT_ROTATE_KEY : LOG_ENCRYPT);
 	}
-
+	srv_stats.log_padded.add(pad_size);
 	/* Do the write to the log file */
 	log_write_buf(
 		write_buf + area_start, area_end - area_start + pad_size,
@@ -759,18 +819,16 @@ static void log_write(bool rotate_key)
 #endif /* UNIV_DEBUG */
 		ut_uint64_align_down(log_sys.write_lsn,
 				     OS_FILE_LOG_BLOCK_SIZE),
-		start_offset - area_start);
-	srv_stats.log_padded.add(pad_size);
-	log_sys.write_lsn = write_lsn;
-	if (log_sys.log.writes_are_durable()) {
-		log_sys.set_flushed_lsn(write_lsn);
-		log_flush_notify(write_lsn);
-	}
+		start_offset - area_start, sync, cb);
 	return;
 }
 
 static group_commit_lock write_lock;
 static group_commit_lock flush_lock;
+
+
+static Log_aio_cb flush_aio_cb;
+static Log_aio_cb write_aio_cb;
 
 #ifdef UNIV_DEBUG
 bool log_write_lock_own()
@@ -779,6 +837,34 @@ bool log_write_lock_own()
 }
 #endif
 
+static void log_write_complete_io(tpool::aiocb *aiocb)
+{
+
+  Log_aio_cb *cb= (Log_aio_cb *)aiocb;
+  DBUG_ASSERT(aiocb->m_opcode == tpool::aio_opcode::AIO_PWRITE);
+  DBUG_ASSERT(cb->do_write || cb->do_flush);
+
+  if (cb->do_write)
+  {
+    log_sys.log.complete_write(cb);
+    log_sys.write_lsn= cb->write_lsn;
+    write_lock.release(cb->write_lsn);
+  }
+
+  if(cb->do_flush)
+  {
+    /* Flush the highest written lsn.*/
+    auto flush_lsn= write_lock.value();
+    flush_lock.set_pending(flush_lsn);
+    log_write_flush_to_disk_low(flush_lsn);
+    flush_lock.release(flush_lsn);
+#ifndef DBUG_OFF
+    if (cb->crash_on_completion)
+      DBUG_SUICIDE();
+#endif
+    log_flush_notify(flush_lsn);
+  }
+}
 
 /** Ensure that the log has been written to the log file up to a given
 log entry (such as that of a transaction commit). Start a new write, or
@@ -802,35 +888,56 @@ void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key,
     ut_a(!callback);
     return;
   }
+  bool use_synchronous_io= callback == nullptr;
 
-  if (flush_to_disk &&
-      flush_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
-    return;
+  Log_aio_cb *cb;
+  if (flush_to_disk)
+  {
+    cb= &flush_aio_cb;
+    if (flush_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
+      return;
+    cb->do_flush= true;
+    /*
+     Check if we should also  write. May be someone else has written already
+     up to lsn, then  we only have to flush.
+    */
+    cb->do_write= write_lock.acquire(lsn, nullptr) == group_commit_lock::ACQUIRED;
+  }
+  else /* write only, don't flush */
+  {
+    if (write_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
+      return;
+    cb= &write_aio_cb;
+    cb->do_flush = false;
+    cb->do_write= true;
+  }
+  cb->synchronous_io= use_synchronous_io;
+  cb->m_opcode = tpool::aio_opcode::AIO_PWRITE;
+  DBUG_EXECUTE_IF("crash_after_log_write_upto",
+                  cb->crash_on_completion= true;);
 
-  if (write_lock.acquire(lsn, flush_to_disk ? nullptr : callback) ==
-      group_commit_lock::ACQUIRED)
+
+  if (cb->do_write)
   {
     mysql_mutex_lock(&log_sys.mutex);
     lsn_t write_lsn= log_sys.get_lsn();
     write_lock.set_pending(write_lsn);
-
-    log_write(rotate_key);
-
-    ut_a(log_sys.write_lsn == write_lsn);
-    write_lock.release(write_lsn);
-  }
-
-  if (!flush_to_disk)
+    cb->write_lsn= write_lsn;
+    cb->m_callback= (tpool::callback_func) log_write_complete_io; 
+    log_write(rotate_key, cb->synchronous_io, cb);
+    /* Releasing locks and flushing etc will be done by completion routine of the AIO.*/
     return;
-
-  /* Flush the highest written lsn.*/
-  auto flush_lsn = write_lock.value();
-  flush_lock.set_pending(flush_lsn);
-  log_write_flush_to_disk_low(flush_lsn);
-  flush_lock.release(flush_lsn);
-
-  log_flush_notify(flush_lsn);
-  DBUG_EXECUTE_IF("crash_after_log_write_upto", DBUG_SUICIDE(););
+  }
+  /* Only flush*/
+  ut_ad(cb == &flush_aio_cb);
+  if (cb->synchronous_io)
+    log_write_complete_io(cb);
+  else
+  {
+    static tpool::task async_flush_task(
+        (tpool::callback_func) log_write_complete_io,&flush_aio_cb);
+    srv_thread_pool->submit_task(&async_flush_task);
+  }
 }
 
 /** write to the log file up to the last log entry.
