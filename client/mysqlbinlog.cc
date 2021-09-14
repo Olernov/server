@@ -151,9 +151,6 @@ static ulonglong start_position= BIN_LOG_HEADER_SIZE,
 #define stop_position_mot  ((my_off_t)stop_position)
 
 static Domain_gtid_event_filter *domain_gtid_filter= NULL;
-static rpl_gtid *start_gtids, *stop_gtids;
-static uint32 n_start_gtid_ranges= 0;
-static uint32 n_stop_gtid_ranges= 0;
 
 static char *start_datetime_str, *stop_datetime_str;
 static my_time_t start_datetime= 0, stop_datetime= MY_TIME_T_MAX;
@@ -1034,9 +1031,11 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
   if (ev_type == GTID_LIST_EVENT && is_gtid_filtering_enabled())
   {
     Gtid_list_log_event *glev= (Gtid_list_log_event *)ev;
-    for (uint i= 0; i < n_start_gtid_ranges; i++)
+    size_t n_start_gtid_ranges= domain_gtid_filter->get_num_start_gtids();
+    rpl_gtid *start_gtids= domain_gtid_filter->get_start_gtids();
+    for (size_t i= 0; i < n_start_gtid_ranges; i++)
     {
-      for (uint k= 0; k < glev->count; k++)
+      for (size_t k= 0; k < glev->count; k++)
       {
         if (start_gtids[i].domain_id == glev->list[k].domain_id)
         {
@@ -1056,9 +1055,11 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
         }
       }
     }
-    for (uint i= 0; i < n_stop_gtid_ranges; i++)
+    size_t n_stop_gtid_ranges= domain_gtid_filter->get_num_stop_gtids();
+    rpl_gtid *stop_gtids= domain_gtid_filter->get_stop_gtids();
+    for (size_t i= 0; i < n_stop_gtid_ranges; i++)
     {
-      for (uint k= 0; k < glev->count; k++)
+      for (size_t k= 0; k < glev->count; k++)
       {
         if (stop_gtids[i].domain_id == glev->list[k].domain_id)
         {
@@ -1078,6 +1079,8 @@ Exit_status process_event(PRINT_EVENT_INFO *print_event_info, Log_event *ev,
         }
       }
     }
+    my_free(start_gtids);
+    my_free(stop_gtids);
   }
   /*
     If the binlog output should be filtered using GTIDs, test the new event
@@ -1923,8 +1926,6 @@ static void cleanup()
   my_free(stop_datetime_str);
   my_free(start_pos_str);
   my_free(stop_pos_str);
-  my_free(start_gtids);
-  my_free(stop_gtids);
   free_root(&glob_root, MYF(0));
 
   delete domain_gtid_filter;
@@ -2180,7 +2181,11 @@ get_one_option(const struct my_option *opt, const char *argument, const char *fi
     break;
   case OPT_STOP_POSITION:
   {
-    stop_gtids= gtid_parse_string_to_list(stop_pos_str, strlen(stop_pos_str),
+    if (domain_gtid_filter && domain_gtid_filter->get_num_stop_gtids() > 0)
+      domain_gtid_filter->clear_stop_gtids();
+
+    uint32 n_stop_gtid_ranges= 0;
+    rpl_gtid *stop_gtids= gtid_parse_string_to_list(stop_pos_str, strlen(stop_pos_str),
                                           &n_stop_gtid_ranges);
     if (stop_gtids == NULL)
     {
@@ -2211,8 +2216,12 @@ get_one_option(const struct my_option *opt, const char *argument, const char *fi
       {
         rpl_gtid *stop_gtid= &stop_gtids[gtid_idx];
         if (domain_gtid_filter->add_stop_gtid(stop_gtid))
+        {
+          my_free(stop_gtids);
           return 1;
+        }
       }
+      my_free(stop_gtids);
     }
     else
     {
@@ -2222,7 +2231,11 @@ get_one_option(const struct my_option *opt, const char *argument, const char *fi
   }
   case 'j':
   {
-    start_gtids= gtid_parse_string_to_list(
+    if (domain_gtid_filter && domain_gtid_filter->get_num_start_gtids() > 0)
+      domain_gtid_filter->clear_start_gtids();
+
+    uint32 n_start_gtid_ranges= 0;
+    rpl_gtid *start_gtids= gtid_parse_string_to_list(
         start_pos_str, strlen(start_pos_str), &n_start_gtid_ranges);
 
     if (start_gtids == NULL)
@@ -2254,8 +2267,12 @@ get_one_option(const struct my_option *opt, const char *argument, const char *fi
       {
         rpl_gtid *start_gtid= &start_gtids[gtid_idx];
         if (domain_gtid_filter->add_start_gtid(start_gtid))
+        {
+          my_free(start_gtids);
           return 1;
+        }
       }
+      my_free(start_gtids);
     }
     else
     {
@@ -2299,6 +2316,7 @@ static int parse_args(int *argc, char*** argv)
   if (domain_gtid_filter)
   {
     Log_event::enable_event_group_filtering();
+    domain_gtid_filter->set_gtid_strict_mode(opt_gtid_strict_mode);
   }
   return 0;
 }
@@ -2481,7 +2499,7 @@ static Exit_status check_master_version()
     goto err;
   }
 
-  if (n_start_gtid_ranges > 0)
+  if (domain_gtid_filter && domain_gtid_filter->get_num_start_gtids() > 0)
   {
     char str_buf[256];
     String query_str(str_buf, sizeof(str_buf), system_charset_info);
@@ -2489,7 +2507,10 @@ static Exit_status check_master_version()
     query_str.append(STRING_WITH_LEN("SET @slave_connect_state='"),
                      system_charset_info);
 
-    for (uint32 gtid_idx = 0; gtid_idx < n_start_gtid_ranges; gtid_idx++)
+    size_t n_start_gtids= domain_gtid_filter->get_num_start_gtids();
+    rpl_gtid *start_gtids= domain_gtid_filter->get_start_gtids();
+
+    for (size_t gtid_idx = 0; gtid_idx < n_start_gtids; gtid_idx++)
     {
       char buf[256];
       rpl_gtid *start_gtid= &start_gtids[gtid_idx];
@@ -2498,9 +2519,10 @@ static Exit_status check_master_version()
               start_gtid->domain_id, start_gtid->server_id,
               start_gtid->seq_no);
       query_str.append(buf, strlen(buf));
-      if (gtid_idx < n_start_gtid_ranges - 1)
+      if (gtid_idx < n_start_gtids - 1)
         query_str.append(',');
     }
+    my_free(start_gtids);
 
     query_str.append(STRING_WITH_LEN("'"), system_charset_info);
     if (unlikely(mysql_real_query(mysql, query_str.ptr(), query_str.length())))

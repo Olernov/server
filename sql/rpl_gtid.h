@@ -500,7 +500,7 @@ protected:
 class Window_gtid_event_filter : public Gtid_event_filter
 {
 public:
-  Window_gtid_event_filter();
+  Window_gtid_event_filter(my_bool *is_gtid_strict_mode);
   ~Window_gtid_event_filter() {}
 
   my_bool exclude(rpl_gtid*);
@@ -522,6 +522,31 @@ public:
   int set_stop_gtid(rpl_gtid *stop);
 
   uint32 get_filter_type() { return WINDOW_GTID_FILTER_TYPE; }
+
+
+  /*
+    Getter/setter methods
+  */
+  my_bool has_start() { return m_has_start; }
+  my_bool has_stop() { return m_has_stop; }
+  rpl_gtid get_start_gtid() { return m_start; }
+  rpl_gtid get_stop_gtid() { return m_stop; }
+
+  void clear_start_pos()
+  {
+    m_has_start= FALSE;
+    m_start.domain_id= 0;
+    m_start.server_id= 0;
+    m_start.seq_no= 0;
+  }
+
+  void clear_stop_pos()
+  {
+    m_has_stop= FALSE;
+    m_stop.domain_id= 0;
+    m_stop.server_id= 0;
+    m_stop.seq_no= 0;
+  }
 
 protected:
 
@@ -579,6 +604,13 @@ private:
                    filtering
   */
   uint32 m_warning_flags;
+
+  /*
+    is_gtid_strict_mode: presents additional warnings in strict mode. This
+                         points to some controller boolean which determines
+                         whether or not gtid_strict_mode is enabled or not.
+  */
+  my_bool *m_is_gtid_strict_mode;
 };
 
 /*
@@ -651,6 +683,12 @@ protected:
 class Domain_gtid_event_filter : public Id_delegating_gtid_event_filter
 {
 public:
+  Domain_gtid_event_filter()
+      : m_num_start_gtids(0), m_num_stop_gtids(0),
+        m_is_gtid_strict_mode(0)
+  {
+  }
+  ~Domain_gtid_event_filter() {}
 
   /*
     Returns the domain id of from the input GTID
@@ -674,7 +712,49 @@ public:
   */
   int add_stop_gtid(rpl_gtid *gtid);
 
+  /*
+    If start or stop position is respecified, we remove all existing values
+    and start over with the new specification.
+  */
+  void clear_start_gtids();
+  void clear_stop_gtids();
+
+  /*
+    Return list of all GTIDs used as start position.
+
+    Note that this list is allocated and it is up to the user to free it
+  */
+  rpl_gtid *get_start_gtids();
+
+  /*
+    Return list of all GTIDs used as stop position.
+
+    Note that this list is allocated and it is up to the user to free it
+  */
+  rpl_gtid *get_stop_gtids();
+
+  size_t get_num_start_gtids() { return m_num_start_gtids; }
+  size_t get_num_stop_gtids() { return m_num_stop_gtids; }
+
+  /*
+    Enable or disable gtid_strict_mode for GTID sequence number processing.
+  */
+  void set_gtid_strict_mode(my_bool gtid_strict_mode_arg)
+  {
+    m_is_gtid_strict_mode= gtid_strict_mode_arg;
+  }
+
 private:
+  size_t m_num_start_gtids, m_num_stop_gtids;
+
+  /*
+    This controls whether gtid_strict_mode is enabled or disabled for all
+    child filters, e.g. of type Window_gtid_event_filter. More specifically,
+    they point to this variable, so when it changes, the behavior of all
+    children using this value changes.
+  */
+  my_bool m_is_gtid_strict_mode;
+
   Window_gtid_event_filter *find_or_create_window_filter_for_id(gtid_filter_identifier);
 };
 

@@ -2994,12 +2994,13 @@ gtid_waiting::remove_from_wait_queue(gtid_waiting::hash_element *he,
 
 #endif
 
-Window_gtid_event_filter::Window_gtid_event_filter() :
+Window_gtid_event_filter::Window_gtid_event_filter(my_bool *is_gtid_strict_mode_arg) :
   m_has_start(FALSE),
   m_has_stop(FALSE),
   m_is_active(FALSE),
   m_has_passed(FALSE),
-  m_warning_flags(0)
+  m_warning_flags(0),
+  m_is_gtid_strict_mode(is_gtid_strict_mode_arg)
   {
     // m_start and m_stop do not need initial values if unused
   }
@@ -3090,8 +3091,6 @@ void Window_gtid_event_filter::verify_gtid_is_expected(rpl_gtid *gtid)
   {
     m_warning_flags |= WARN_GTID_SEQUENCE_NUMBER_OUT_OF_ORDER;
   }
-
-  last_gtid_seen.seq_no++;
 }
 
 my_bool Window_gtid_event_filter::exclude(rpl_gtid *gtid)
@@ -3152,7 +3151,9 @@ my_bool Window_gtid_event_filter::exclude(rpl_gtid *gtid)
       in the results. Additionally check if we are at the end of the window.
       If no end of the window is provided, go indefinitely
     */
-    verify_gtid_is_expected(gtid);
+    if (*m_is_gtid_strict_mode)
+      verify_gtid_is_expected(gtid);
+
     should_exclude= FALSE;
 
     if (m_has_stop && is_gtid_at_or_after(&m_stop, gtid))
@@ -3173,6 +3174,8 @@ my_bool Window_gtid_event_filter::exclude(rpl_gtid *gtid)
         should_exclude= TRUE;
       }
     }
+
+    last_gtid_seen.seq_no= gtid->seq_no;
   }
 
   return should_exclude;
@@ -3364,7 +3367,7 @@ Domain_gtid_event_filter::find_or_create_window_filter_for_id(
   if (filter_element->filter == NULL)
   {
     // New filter
-    wgef= new Window_gtid_event_filter();
+    wgef= new Window_gtid_event_filter(&m_is_gtid_strict_mode);
     filter_element->filter= new Identifiable_gtid_event_filter(domain_id, wgef);
     m_num_explicit_filters++;
   }
@@ -3395,9 +3398,14 @@ int Domain_gtid_event_filter::add_start_gtid(rpl_gtid *gtid)
       find_or_create_window_filter_for_id(gtid->domain_id);
 
   if (filter_to_update == NULL)
+  {
     err= 1;
+  }
   else
+  {
     err= filter_to_update->set_start_gtid(gtid);
+    m_num_start_gtids++;
+  }
 
   return err;
 }
@@ -3409,9 +3417,195 @@ int Domain_gtid_event_filter::add_stop_gtid(rpl_gtid *gtid)
       find_or_create_window_filter_for_id(gtid->domain_id);
 
   if (filter_to_update == NULL)
+  {
     err= 1;
+  }
   else
+  {
     err= filter_to_update->set_stop_gtid(gtid);
+    m_num_stop_gtids++;
+  }
 
   return err;
+}
+
+rpl_gtid *Domain_gtid_event_filter::get_start_gtids()
+{
+  rpl_gtid *gtid_list;
+  uint32 i;
+
+  gtid_list= (rpl_gtid *) my_malloc(
+      PSI_INSTRUMENT_ME, m_num_start_gtids * sizeof(rpl_gtid), MYF(MY_WME));
+
+  size_t cur_gtid_pos= 0;
+  for (i = 0; i <= m_filter_id_mask; i++)
+  {
+    gtid_filter_element *filter_element= m_filters_by_id[i];
+    while(filter_element && filter_element->filter)
+    {
+      if(filter_element->filter->get_filter_type() == WINDOW_GTID_FILTER_TYPE)
+      {
+        Identifiable_gtid_event_filter *igef=
+            (Identifiable_gtid_event_filter *) filter_element->filter;
+        Window_gtid_event_filter *wgef=
+            (Window_gtid_event_filter *) igef->get_identified_filter();
+
+        if(wgef->has_start())
+        {
+          rpl_gtid win_start_gtid= wgef->get_start_gtid();
+          rpl_gtid *cur_gtid= &gtid_list[cur_gtid_pos++];
+
+          cur_gtid->domain_id= win_start_gtid.domain_id;
+          cur_gtid->server_id= win_start_gtid.server_id;
+          cur_gtid->seq_no= win_start_gtid.seq_no;
+        }
+      }
+      filter_element= filter_element->next;
+    }
+  }
+
+  return gtid_list;
+}
+
+rpl_gtid *Domain_gtid_event_filter::get_stop_gtids()
+{
+  rpl_gtid *gtid_list;
+  uint32 i;
+
+  gtid_list= (rpl_gtid *) my_malloc(
+      PSI_INSTRUMENT_ME, m_num_stop_gtids * sizeof(rpl_gtid), MYF(MY_WME));
+
+  size_t cur_gtid_pos= 0;
+  for (i = 0; i <= m_filter_id_mask; i++)
+  {
+    gtid_filter_element *filter_element= m_filters_by_id[i];
+    while(filter_element && filter_element->filter)
+    {
+      if(filter_element->filter->get_filter_type() == WINDOW_GTID_FILTER_TYPE)
+      {
+        Identifiable_gtid_event_filter *igef=
+            (Identifiable_gtid_event_filter *) filter_element->filter;
+        Window_gtid_event_filter *wgef=
+            (Window_gtid_event_filter *) igef->get_identified_filter();
+
+        if(wgef->has_stop())
+        {
+          rpl_gtid win_stop_gtid= wgef->get_stop_gtid();
+          rpl_gtid *cur_gtid= &gtid_list[cur_gtid_pos++];
+
+          cur_gtid->domain_id= win_stop_gtid.domain_id;
+          cur_gtid->server_id= win_stop_gtid.server_id;
+          cur_gtid->seq_no= win_stop_gtid.seq_no;
+        }
+      }
+      filter_element= filter_element->next;
+    }
+  }
+
+  return gtid_list;
+}
+
+void Domain_gtid_event_filter::clear_start_gtids()
+{
+  uint32 i;
+  for (i = 0; i <= m_filter_id_mask; i++)
+  {
+    gtid_filter_element *filter_element= m_filters_by_id[i],
+                        *prev_filter_element= NULL;
+    while(filter_element && filter_element->filter)
+    {
+      if(filter_element->filter->get_filter_type() == WINDOW_GTID_FILTER_TYPE)
+      {
+
+        Identifiable_gtid_event_filter *igef=
+            (Identifiable_gtid_event_filter *) filter_element->filter;
+        Window_gtid_event_filter *wgef=
+            (Window_gtid_event_filter *) igef->get_identified_filter();
+        if(wgef->has_start())
+        {
+          /*
+            Clear this filter. Either delete it or just remove the start
+          */
+          if (wgef->has_stop())
+          {
+            /*
+              Just remove the start on this filter, we still have the stop here
+            */
+            wgef->clear_start_pos();
+          }
+          else
+          {
+            // Check to reset bucket
+            if (!filter_element->next && !prev_filter_element)
+              m_filters_by_id[i]= NULL;
+            else if(prev_filter_element)
+              prev_filter_element->next= filter_element->next;
+
+            m_num_explicit_filters--;
+            delete igef;
+            my_free(filter_element);
+            filter_element= prev_filter_element;
+            if (filter_element == NULL)
+              break;
+          }
+        }
+      }
+      prev_filter_element= filter_element;
+      filter_element= filter_element->next;
+    }
+  }
+
+  m_num_start_gtids= 0;
+}
+
+void Domain_gtid_event_filter::clear_stop_gtids()
+{
+  uint32 i;
+  for (i = 0; i <= m_filter_id_mask; i++)
+  {
+    gtid_filter_element *filter_element= m_filters_by_id[i],
+                        *prev_filter_element= NULL;
+    while(filter_element && filter_element->filter)
+    {
+      if(filter_element->filter->get_filter_type() == WINDOW_GTID_FILTER_TYPE)
+      {
+        Identifiable_gtid_event_filter *igef=
+            (Identifiable_gtid_event_filter *) filter_element->filter;
+        Window_gtid_event_filter *wgef=
+            (Window_gtid_event_filter *) igef->get_identified_filter();
+        if(wgef->has_stop())
+        {
+          /*
+            Clear this filter. Either delete it or just remove the stop
+          */
+          if (wgef->has_start())
+          {
+            /*
+              Just remove the stop on this filter, we still have the start here
+            */
+            wgef->clear_stop_pos();
+          }
+          else
+          {
+            // Check to reset bucket
+            if (!filter_element->next && !prev_filter_element)
+              m_filters_by_id[i]= NULL;
+            else if(prev_filter_element)
+              prev_filter_element->next= filter_element->next;
+
+            m_num_explicit_filters--;
+            delete igef;
+            my_free(filter_element);
+            filter_element= prev_filter_element;
+            if (filter_element == NULL)
+              break;
+          }
+        }
+      }
+      prev_filter_element= filter_element;
+      filter_element= filter_element->next;
+    }
+  }
+
+  m_num_stop_gtids= 0;
 }
