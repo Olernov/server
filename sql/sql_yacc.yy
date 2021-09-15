@@ -3450,6 +3450,8 @@ signal_condition_information_item_name:
           { $$= DIAG_MESSAGE_TEXT; }
         | MYSQL_ERRNO_SYM
           { $$= DIAG_MYSQL_ERRNO; }
+        | ERROR_INDEX_SYM
+          { $$= DIAG_ERROR_INDEX; }
         ;
 
 resignal_stmt:

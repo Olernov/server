@@ -751,7 +751,8 @@ private:
   */
   Sql_condition *push_warning(THD *thd,
                               const Sql_condition_identity *identity,
-                              const char* msg);
+                              const char* msg,
+                              ulonglong error_index);
 
   /**
     Add a new SQL-condition to the current list and increment the respective
@@ -762,7 +763,7 @@ private:
 
     @return a pointer to the added SQL-condition.
   */
-  Sql_condition *push_warning(THD *thd, const Sql_condition *sql_condition);
+  Sql_condition *push_warning(THD *thd, const Sql_condition *sql_condition, ulonglong error_index);
 
   /**
     Set the read only status for this statement area.
@@ -1175,17 +1176,18 @@ public:
   { get_warning_info()->reserve_space(thd, count); }
 
   Sql_condition *push_warning(THD *thd, const Sql_condition *sql_condition)
-  { return get_warning_info()->push_warning(thd, sql_condition); }
+  { return get_warning_info()->push_warning(thd, sql_condition, 0); }
 
   Sql_condition *push_warning(THD *thd,
                               uint sql_errno_arg,
                               const char* sqlstate,
                               Sql_condition::enum_warning_level level,
                               const Sql_user_condition_identity &ucid,
-                              const char* msg)
+                              const char* msg,
+                              ulonglong insert_index)
   {
     Sql_condition_identity tmp(sql_errno_arg, sqlstate, level, ucid);
-    return get_warning_info()->push_warning(thd, &tmp, msg);
+    return get_warning_info()->push_warning(thd, &tmp, msg, insert_index);
   }
 
   Sql_condition *push_warning(THD *thd,
@@ -1195,7 +1197,7 @@ public:
                               const char* msg)
   {
     return push_warning(thd, sqlerrno, sqlstate, level,
-                        Sql_user_condition_identity(), msg);
+                        Sql_user_condition_identity(), msg, 0);
   }
   void mark_sql_conditions_for_removal()
   { get_warning_info()->mark_sql_conditions_for_removal(); }

@@ -1552,3 +1552,19 @@ DROP TABLE t1,t2;
 DROP FUNCTION f1;
 DROP FUNCTION f2;
 DROP  VIEW v;
+#
+# MDEV-26606: ERROR_INDEX property value isn't passed from inside a
+# stored procedure
+#
+CREATE OR REPLACE TABLE t1 (pk INT PRIMARY KEY);
+CREATE OR REPLACE PROCEDURE sp(a INT) INSERT INTO t1 VALUES (2),(a);
+SET @num=null, @msg=null;
+INSERT INTO t1 VALUES(1);
+CALL sp(1);
+ERROR 23000: Duplicate entry '1' for key 'PRIMARY'
+GET DIAGNOSTICS CONDITION 1 @num = ERROR_INDEX, @msg = MESSAGE_TEXT;
+SELECT @num, @msg;
+@num	@msg
+2	Duplicate entry '1' for key 'PRIMARY'
+DROP PROCEDURE sp;
+DROP TABLE t1;

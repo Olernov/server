@@ -570,7 +570,7 @@ void Warning_info::append_warning_info(THD *thd, const Warning_info *source)
   while ((err= it++))
   {
     // Do not use ::push_warning() to avoid invocation of THD-internal-handlers.
-    Sql_condition *new_error= Warning_info::push_warning(thd, err);
+    Sql_condition *new_error= Warning_info::push_warning(thd, err, err->error_index);
 
     if (src_error_condition && src_error_condition == err)
       set_error_condition(new_error);
@@ -602,7 +602,7 @@ void Diagnostics_area::copy_non_errors_from_wi(THD *thd,
     if (cond->get_level() == Sql_condition::WARN_LEVEL_ERROR)
       continue;
 
-    Sql_condition *new_condition= wi->push_warning(thd, cond);
+    Sql_condition *new_condition= wi->push_warning(thd, cond, 0);
 
     if (src_wi->is_marked_for_removal(cond))
       wi->mark_condition_for_removal(new_condition);
@@ -663,7 +663,8 @@ void Warning_info::reserve_space(THD *thd, uint count)
 
 Sql_condition *Warning_info::push_warning(THD *thd,
                                           const Sql_condition_identity *value,
-                                          const char *msg)
+                                          const char *msg,
+                                          ulonglong error_index)
 {
   Sql_condition *cond= NULL;
 
@@ -673,7 +674,7 @@ Sql_condition *Warning_info::push_warning(THD *thd,
         m_warn_list.elements() < thd->variables.max_error_count)
     {
       cond= new (& m_warn_root) Sql_condition(& m_warn_root, *value, msg,
-                                              thd->current_insert_index);
+                                              error_index);
       if (cond)
         m_warn_list.push_back(cond);
     }
@@ -686,10 +687,10 @@ Sql_condition *Warning_info::push_warning(THD *thd,
 
 
 Sql_condition *Warning_info::push_warning(THD *thd,
-                                          const Sql_condition *sql_condition)
+                                          const Sql_condition *sql_condition, ulonglong error_index)
 {
   Sql_condition *new_condition= push_warning(thd, sql_condition,
-                                             sql_condition->get_message_text());
+                                             sql_condition->get_message_text(), error_index);
 
   if (new_condition)
     new_condition->copy_opt_attributes(sql_condition);

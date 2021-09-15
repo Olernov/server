@@ -1154,7 +1154,7 @@ Sql_condition* THD::raise_condition(uint sql_errno,
   {
     saved_error_index= this->current_insert_index;
     this->current_insert_index= this->correct_error_index(sql_errno);
-    cond= da->push_warning(this, sql_errno, sqlstate, level, ucid, msg);
+    cond= da->push_warning(this, sql_errno, sqlstate, level, ucid, msg, this->current_insert_index);
     this->current_insert_index= saved_error_index;
   }
   DBUG_RETURN(cond);
